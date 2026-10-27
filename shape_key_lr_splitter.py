@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Shape Key L/R Splitter",
     "author": "Shape Key L/R Splitter contributors",
-    "version": (1, 2, 0),
+    "version": (1, 5, 2),
     "blender": (3, 6, 0),
     "location": "3D View > Sidebar > Shape Key Splitter",
     "description": "Split a shape key into left and right with an adjustable center transition",
@@ -15,6 +15,7 @@ from array import array
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, PointerProperty
 from bpy.types import Operator, Panel, PropertyGroup
 from gpu_extras.batch import batch_for_shader
+from mathutils import Matrix, Vector
 
 
 _draw_handle = None
@@ -64,13 +65,18 @@ def preview_coordinates(obj, side, amount, center, width):
 
     basis = coordinates(keys[0])
     result = basis.copy()
-    # Match the other active relative keys, while replacing the selected key.
+    # A side replaces the selected key; None returns the current shape mix.
     for key in list(keys)[1:]:
-        if key == source or key.mute or key.value == 0.0:
+        if (side is not None and key == source) or key.mute or key.value == 0.0:
             continue
         result += (coordinates(key) - coordinates(key.relative_key)) * key.value * group_mask(key.vertex_group)
 
-    if width <= 0.0:
+    if side is None:
+        return result
+
+    if side == 'FULL':
+        weights = np.ones(count, dtype=np.float32)
+    elif width <= 0.0:
         weights = np.where(basis[:, 0] > center, 1.0,
                            np.where(basis[:, 0] < center, 0.0, 0.5))
     else:
@@ -81,6 +87,184 @@ def preview_coordinates(obj, side, amount, center, width):
     result += ((coordinates(source) - coordinates(source.relative_key))
                * weights[:, None] * amount * group_mask(source.vertex_group))
     return result
+
+
+def surface_boundary_segments(surface_positions, triangles, planes):
+    """Intersect local X planes with the deformed mesh surface."""
+    result = []
+    triangle_x = surface_positions[triangles, 0]
+    epsilon = max(float(np.ptp(surface_positions[:, 0])) * 1e-7, 1e-8)
+    for plane in planes:
+        distances = triangle_x - plane
+        candidates = np.flatnonzero((distances.min(axis=1) <= epsilon)
+                                    & (distances.max(axis=1) >= -epsilon))
+        for index in candidates:
+            d = distances[index]
+            if np.all(np.abs(d) <= epsilon):
+                continue
+            points = surface_positions[triangles[index]]
+            hits = []
+            for a, b in ((0, 1), (1, 2), (2, 0)):
+                if abs(d[a]) <= epsilon:
+                    hits.append(points[a])
+                if (d[a] < -epsilon and d[b] > epsilon) or (d[a] > epsilon and d[b] < -epsilon):
+                    hits.append(points[a] + (points[b] - points[a]) * (d[a] / (d[a] - d[b])))
+            unique = []
+            for point in hits:
+                if not any(np.linalg.norm(point - old) <= epsilon for old in unique):
+                    unique.append(point)
+            if len(unique) >= 2:
+                result.extend(unique[:2])
+    return result
+
+
+def active_surface_coordinates(context, obj, center, width):
+    """Place the fully active shape in the evaluated armature-deformed space."""
+    full = preview_coordinates(obj, 'FULL', 1.0, center, width)
+    modifiers = [modifier for modifier in obj.modifiers if modifier.show_viewport]
+    if not modifiers:
+        return full
+    # Vertex-group armatures are linear in the shape-key displacement. Other
+    # modifiers cannot generally be applied to a hypothetical shape without
+    # changing the user's scene, so retain the unmodified shape in those cases.
+    if len(modifiers) != 1 or modifiers[0].type != 'ARMATURE':
+        return full
+    modifier = modifiers[0]
+    armature = modifier.object
+    if (not armature or not modifier.use_vertex_groups or modifier.use_bone_envelopes
+            or modifier.use_deform_preserve_volume):
+        return full
+
+    depsgraph = context.evaluated_depsgraph_get()
+    evaluated_obj = obj.evaluated_get(depsgraph)
+    evaluated_armature = armature.evaluated_get(depsgraph)
+    mesh = evaluated_obj.to_mesh()
+    try:
+        if len(mesh.vertices) != len(obj.data.vertices):
+            return full
+        evaluated = np.empty(len(mesh.vertices) * 3, dtype=np.float32)
+        mesh.vertices.foreach_get('co', evaluated)
+        evaluated = evaluated.reshape((-1, 3))
+    finally:
+        evaluated_obj.to_mesh_clear()
+
+    delta = full - preview_coordinates(obj, None, 0.0, center, width)
+    object_to_armature = evaluated_armature.matrix_world.inverted_safe() @ evaluated_obj.matrix_world
+    armature_to_object = object_to_armature.inverted_safe()
+    group_transforms = {}
+    for group in obj.vertex_groups:
+        bone = evaluated_armature.pose.bones.get(group.name)
+        if bone and bone.bone.use_deform:
+            if bone.bone.bbone_segments > 1:
+                return full
+            transform = armature_to_object @ bone.matrix @ bone.bone.matrix_local.inverted_safe() @ object_to_armature
+            group_transforms[group.index] = np.asarray(transform.to_3x3(), dtype=np.float32)
+
+    weighted = np.zeros_like(delta)
+    total = np.zeros(len(delta), dtype=np.float32)
+    mask = np.zeros(len(delta), dtype=np.float32) if modifier.vertex_group else None
+    mask_group = obj.vertex_groups.get(modifier.vertex_group) if modifier.vertex_group else None
+    for vertex in obj.data.vertices:
+        for membership in vertex.groups:
+            if mask is not None and mask_group and membership.group == mask_group.index:
+                mask[vertex.index] = membership.weight
+            transform = group_transforms.get(membership.group)
+            if transform is not None:
+                weighted[vertex.index] += (transform @ delta[vertex.index]) * membership.weight
+                total[vertex.index] += membership.weight
+    valid = total > 0.0
+    weighted[valid] /= total[valid, None]
+    weighted[~valid] = delta[~valid]
+    if mask is not None:
+        if modifier.invert_vertex_group:
+            mask = 1.0 - mask
+        weighted = delta + (weighted - delta) * mask[:, None]
+    return evaluated + weighted
+
+
+def transition_surface_lines(context, obj, center, width):
+    """Intersect the boundary planes with the selected key at full strength."""
+    mesh = obj.data
+    if width <= 0.0 or not mesh.polygons:
+        return None, None, []
+    mesh.calc_loop_triangles()
+    if not mesh.loop_triangles:
+        return None, None, []
+    triangle_indices = np.empty(len(mesh.loop_triangles) * 3, dtype=np.int32)
+    mesh.loop_triangles.foreach_get('vertices', triangle_indices)
+    triangle_indices = triangle_indices.reshape((-1, 3))
+    surface = active_surface_coordinates(context, obj, center, width)
+    lines = surface_boundary_segments(surface, triangle_indices,
+                                     (center - width / 2, center + width / 2))
+    return surface, triangle_indices, lines
+
+
+def draw_self_occluded_overlay(context, obj, shader, positions, triangles,
+                               lines, line_indices, fill_color, line_color, line_width):
+    """Depth-test an overlay against its own surface in a transparent buffer."""
+    viewport = gpu.state.viewport_get()
+    if viewport[2] <= 0 or viewport[3] <= 0:
+        return
+    size = (viewport[2], viewport[3])
+    color_texture = gpu.types.GPUTexture(size, format='RGBA8')
+    depth_texture = gpu.types.GPUTexture(size, format='DEPTH_COMPONENT24')
+    preview_framebuffer = gpu.types.GPUFrameBuffer(depth_slot=depth_texture, color_slots=(color_texture,))
+    try:
+        with preview_framebuffer.bind():
+            gpu.state.viewport_set(0, 0, *size)
+            framebuffer = gpu.state.active_framebuffer_get()
+            framebuffer.clear(color=(0, 0, 0, 0), depth=1.0)
+            gpu.state.blend_set('NONE')
+            gpu.state.depth_test_set('LESS_EQUAL')
+            gpu.state.depth_mask_set(True)
+            shader.bind()
+            if len(triangles):
+                shader.uniform_float('color', fill_color)
+                batch_for_shader(shader, 'TRIS', {"pos": positions},
+                                 indices=triangles).draw(shader)
+            if len(lines):
+                line_positions = np.asarray(lines)
+                if context.region_data:
+                    toward_view = context.region_data.view_rotation @ Vector((0, 0, 1))
+                    offset = obj.matrix_world.inverted_safe().to_3x3() @ (
+                        toward_view * max(max(obj.dimensions), 0.001) * 0.0005)
+                    line_positions = line_positions + np.asarray(offset)
+                gpu.state.depth_mask_set(False)
+                gpu.state.line_width_set(line_width)
+                shader.uniform_float('color', line_color)
+                batch_for_shader(shader, 'LINES', {"pos": line_positions},
+                                 indices=line_indices).draw(shader)
+
+        gpu.state.viewport_set(*viewport)
+        gpu.state.depth_mask_set(False)
+        gpu.state.depth_test_set('NONE')
+        gpu.state.blend_set('ALPHA')
+        image_shader = gpu.shader.from_builtin('IMAGE')
+        image_shader.bind()
+        image_shader.uniform_sampler('image', color_texture)
+        with gpu.matrix.push_pop(), gpu.matrix.push_pop_projection():
+            gpu.matrix.load_identity()
+            gpu.matrix.load_projection_matrix(Matrix.Identity(4))
+            batch_for_shader(image_shader, 'TRI_FAN', {
+                'pos': [(-1, -1), (1, -1), (1, 1), (-1, 1)],
+                'texCoord': [(0, 0), (1, 0), (1, 1), (0, 1)],
+            }).draw(image_shader)
+    finally:
+        gpu.state.viewport_set(*viewport)
+
+
+def draw_side_preview(context, obj, settings, width, shader):
+    mesh = obj.data
+    positions = preview_coordinates(obj, settings.preview_side,
+                                    settings.preview_amount, settings.center, width)
+    mesh.calc_loop_triangles()
+    triangles = np.empty(len(mesh.loop_triangles) * 3, dtype=np.int32)
+    mesh.loop_triangles.foreach_get('vertices', triangles)
+    edges = np.empty(len(mesh.edges) * 2, dtype=np.int32)
+    mesh.edges.foreach_get('vertices', edges)
+    draw_self_occluded_overlay(context, obj, shader, positions, triangles.reshape((-1, 3)),
+                               positions if len(edges) else [], edges.reshape((-1, 2)),
+                               (0.8, 0.25, 1.0, 0.35), (0.9, 0.4, 1.0, 0.9), 1.0)
 
 
 def draw_transition_preview():
@@ -120,7 +304,12 @@ def draw_transition_preview():
     center = rectangle(settings.center)
     with gpu.matrix.push_pop():
         gpu.matrix.multiply_matrix(obj.matrix_world)
+        previous_blend = gpu.state.blend_get()
+        previous_depth_test = gpu.state.depth_test_get()
+        previous_depth_mask = gpu.state.depth_mask_get()
+        previous_line_width = gpu.state.line_width_get()
         gpu.state.blend_set('ALPHA')
+        gpu.state.depth_mask_set(False)
         gpu.state.depth_test_set('NONE')
         try:
             shader.bind()
@@ -135,25 +324,18 @@ def draw_transition_preview():
                 shader.uniform_float('color', (1.0, 0.7, 0.1, 1.0))
                 batch_for_shader(shader, 'LINES', {"pos": outline(center)}).draw(shader)
             if settings.preview_side != 'OFF':
-                mesh = obj.data
-                positions = preview_coordinates(obj, settings.preview_side,
-                                                settings.preview_amount, settings.center, width)
-                mesh.calc_loop_triangles()
-                if mesh.loop_triangles:
-                    triangles = np.empty(len(mesh.loop_triangles) * 3, dtype=np.int32)
-                    mesh.loop_triangles.foreach_get('vertices', triangles)
-                    shader.uniform_float('color', (0.8, 0.25, 1.0, 0.12))
-                    batch_for_shader(shader, 'TRIS', {"pos": positions},
-                                     indices=triangles.reshape((-1, 3))).draw(shader)
-                if mesh.edges:
-                    edges = np.empty(len(mesh.edges) * 2, dtype=np.int32)
-                    mesh.edges.foreach_get('vertices', edges)
-                    shader.uniform_float('color', (0.9, 0.4, 1.0, 0.9))
-                    batch_for_shader(shader, 'LINES', {"pos": positions},
-                                     indices=edges.reshape((-1, 2))).draw(shader)
+                draw_side_preview(context, obj, settings, width, shader)
+            if settings.show_preview and width > 0.0:
+                surface, triangles, lines = transition_surface_lines(context, obj, settings.center, width)
+                if lines:
+                    draw_self_occluded_overlay(context, obj, shader, surface, triangles,
+                                               lines, None, (0, 0, 0, 0),
+                                               (0.02, 0.65, 1.0, 1.0), 2.0)
         finally:
-            gpu.state.blend_set('NONE')
-            gpu.state.depth_test_set('NONE')
+            gpu.state.blend_set(previous_blend)
+            gpu.state.depth_test_set(previous_depth_test)
+            gpu.state.depth_mask_set(previous_depth_mask)
+            gpu.state.line_width_set(previous_line_width)
 
 
 def left_weight(x, center, width):
