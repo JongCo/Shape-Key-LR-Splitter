@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Shape Key L/R Splitter",
     "author": "Shape Key L/R Splitter contributors",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (3, 6, 0),
     "location": "3D View > Sidebar > Shape Key Splitter",
     "description": "Split a shape key into left and right with an adjustable center transition",
@@ -9,8 +9,84 @@ bl_info = {
 }
 
 import bpy
-from bpy.props import FloatProperty, PointerProperty
+import gpu
+from array import array
+from bpy.props import BoolProperty, FloatProperty, PointerProperty
 from bpy.types import Operator, Panel, PropertyGroup
+from gpu_extras.batch import batch_for_shader
+
+
+_draw_handle = None
+
+
+def redraw_viewports(_self, context):
+    """Refresh every 3D view as the preview settings are changed."""
+    for window in context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+
+
+def basis_bounds(basis):
+    """Return local-space bounds using the same Basis coordinates as the split."""
+    coords = array('f', [0.0]) * (len(basis.data) * 3)
+    basis.data.foreach_get('co', coords)
+    axes = [coords[i::3] for i in range(3)]
+    return tuple((min(axis), max(axis)) for axis in axes)
+
+
+def draw_transition_preview():
+    context = bpy.context
+    scene = context.scene
+    obj = context.active_object
+    space = context.space_data
+    if (not scene or not space or space.type != 'VIEW_3D'
+            or not space.overlay.show_overlays
+            or not scene.shape_key_lr_splitter.show_preview
+            or not obj or obj.type != 'MESH' or obj.mode != 'OBJECT'
+            or not obj.visible_get()):
+        return
+    keys = obj.data.shape_keys
+    if (not keys or not keys.use_relative or obj.active_shape_key_index == 0
+            or not keys.key_blocks[0].data):
+        return
+
+    bounds = basis_bounds(keys.key_blocks[0])
+    settings = scene.shape_key_lr_splitter
+    width = (bounds[0][1] - bounds[0][0]) * settings.transition_percent / 100.0
+    # Give flat meshes and the box edges enough room to remain visible.
+    margin = max(max(high - low for low, high in bounds) * 0.05, 0.001)
+    y0, y1 = bounds[1][0] - margin, bounds[1][1] + margin
+    z0, z1 = bounds[2][0] - margin, bounds[2][1] + margin
+
+    def rectangle(x):
+        return [(x, y0, z0), (x, y1, z0), (x, y1, z1), (x, y0, z1)]
+
+    def outline(points):
+        return [points[i] for pair in ((0, 1), (1, 2), (2, 3), (3, 0)) for i in pair]
+
+    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    boundaries = [rectangle(settings.center - width / 2),
+                  rectangle(settings.center + width / 2)]
+    center = rectangle(settings.center)
+    with gpu.matrix.push_pop():
+        gpu.matrix.multiply_matrix(obj.matrix_world)
+        gpu.state.blend_set('ALPHA')
+        gpu.state.depth_test_set('NONE')
+        try:
+            shader.bind()
+            if width > 0.0:
+                triangles = [point for rect in boundaries
+                             for point in (rect[0], rect[1], rect[2], rect[0], rect[2], rect[3])]
+                shader.uniform_float('color', (0.05, 0.8, 1.0, 0.07))
+                batch_for_shader(shader, 'TRIS', {"pos": triangles}).draw(shader)
+                shader.uniform_float('color', (0.05, 0.8, 1.0, 0.8))
+                batch_for_shader(shader, 'LINES', {"pos": outline(boundaries[0]) + outline(boundaries[1])}).draw(shader)
+            shader.uniform_float('color', (1.0, 0.7, 0.1, 1.0))
+            batch_for_shader(shader, 'LINES', {"pos": outline(center)}).draw(shader)
+        finally:
+            gpu.state.blend_set('NONE')
+            gpu.state.depth_test_set('NONE')
 
 
 def left_weight(x, center, width):
@@ -24,6 +100,12 @@ def left_weight(x, center, width):
 
 
 class SHAPEKEYSPLIT_PG_settings(PropertyGroup):
+    show_preview: BoolProperty(
+        name="Show Transition Preview",
+        description="Show the center and transition boundaries in the 3D Viewport",
+        default=True,
+        update=redraw_viewports,
+    )
     transition_percent: FloatProperty(
         name="Transition Width",
         description="Full transition width as a percentage of the Basis mesh's local X width",
@@ -31,12 +113,14 @@ class SHAPEKEYSPLIT_PG_settings(PropertyGroup):
         min=0.0,
         max=100.0,
         subtype='PERCENTAGE',
+        update=redraw_viewports,
     )
     center: FloatProperty(
         name="Center X",
         description="Center of the transition in the object's local X coordinates",
         default=0.0,
         subtype='DISTANCE',
+        update=redraw_viewports,
     )
 
 
@@ -126,6 +210,7 @@ class SHAPEKEYSPLIT_PT_panel(Panel):
 
         layout.label(text=f"Active: {obj.active_shape_key.name}")
         settings = context.scene.shape_key_lr_splitter
+        layout.prop(settings, "show_preview", icon='HIDE_OFF')
         layout.prop(settings, "transition_percent", slider=True)
         layout.prop(settings, "center")
         layout.label(text="L: +X   |   R: -X")
@@ -140,15 +225,25 @@ classes = (
 
 
 def register():
+    global _draw_handle
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.shape_key_lr_splitter = PointerProperty(type=SHAPEKEYSPLIT_PG_settings)
+    _draw_handle = bpy.types.SpaceView3D.draw_handler_add(draw_transition_preview, (), 'WINDOW', 'POST_VIEW')
 
 
 def unregister():
+    global _draw_handle
+    if _draw_handle is not None:
+        bpy.types.SpaceView3D.draw_handler_remove(_draw_handle, 'WINDOW')
+        _draw_handle = None
     del bpy.types.Scene.shape_key_lr_splitter
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
 
 
 if __name__ == "__main__":
